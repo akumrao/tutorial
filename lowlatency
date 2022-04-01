@@ -1,0 +1,64 @@
+Last July, I read a highly upvoted article on Hacker News claiming that it was possible to play games from an AWS GPU instance. I immediately followed the steps outlined in the article, and before long I was interactively streaming Steam games over the internet. It was far from perfect, but much better than I expected; first-person-shooter games were pretty unplayable, but console style games like Witcher 3 were more forgiving with latency. While there was much room for improvement, I was convinced that some iteration of the tech described in that article would profoundly change the way we game — and I needed to get involved.
+
+Thus began our journey to understand the latency problem of cloud gaming, and then attempt to solve that problem in the best possible way with Parsec. In cloud gaming, a 20 ms total latency vs. a 40 ms total latency can be the difference between awesome and unplayable — so every millisecond counts.
+
+Parsec is meant to be highly optimized for streaming games, with a lean set of other features to handle things like authentication, port forwarding, and sharing for you. Beyond that, it’s meant to get the hell out of your way and let you enjoy your games. Parsec gives you full desktop access and works with any program, game or not. You can think of it like a remote desktop app on steroids.
+
+In this article, I’ll briefly describe how our technology works (if you’re interested in more depth, let us know so we can post a follow-up) and the measures we’ve taken to eliminate latency wherever it might hide. Parsec is ready for personal use (over LAN or WAN), and we also have an EC2 AMI available for quick cloud setup.
+
+All Hardware, All the Time: Getting Performance out of H.264
+At its core, Parsec is a high performance video streaming app. The process generally looks like this:
+
+Capture raw desktop frames
+Encode the raw frames
+Send the encoded frames over the network
+Decode the frames
+Render the frames on the screen
+Windows (since 8.1) offers a very efficient API to capture desktop frames. The Desktop Duplication API essentially gives you a direct framebuffer grab and places the frame in video memory for processing. Unfortunately, until networking technology gets a hell of a lot better, these frames need some type of compression in order to be streamed over the network at any reasonable frame rate. And when it comes to compression, H.264 is really the only viable choice. Yes, there are other codecs out there, most notably H.265, but let me explain.
+
+
+http://s3securitysystems.com/h-265-the-arrival-of-video-compressions-future/
+We’ve made the decision at Parsec to only support hardware enabled video encoding and decoding. What this means is that we always offload this video processing to special ASICs on your GPU specifically designed to encode/decode certain video codecs. H.264 has the distinction of being by far the most widely supported among hardware vendors, and is thus the default choice for Parsec. H.265 is becoming more widely supported, and will become an option in Parsec soon, but until mass distribution of H.265 happens, we decided to rely on the more widely distributed H.264.
+
+And why only hardware support? Because performance is generally abysmal when the CPU tries to do video processing, and we’d rather not offer it as an option. Lower-end CPUs may struggle to reach 60 FPS at higher resolutions, and even if they do, there is usually a huge latency penalty. Hardware enabled H.264 devices started appearing circa 2012, so if you have a device released in the last four years, you’re probably good to go.
+
+When it comes to GPU hardware vendors, the big three are NVIDIA, AMD, and Intel. Each vendor has a different C API for interacting with their video processing hardware, and with different APIs comes different quirks and performance tweaks. Parsec directly implements these libraries from all three vendors with no wrappers. Depending on how recent your GPUs are, we’ve seen total encode/decode latencies lower than 10 ms, much lower than we were expecting, and much better than latency has been in recent years.
+
+OnLive was founded in 2003, and a recent independent study found that their latency was 150ms, making most twitch games unplayable. Parsec has vastly improved on that experience, but it wouldn’t have been possible without the leaps in technology made since OnLive appeared in 2003.
+
+
+Zero-copy, Color Conversions, and Rendering
+Dealing with H.264 is only half the battle. As mentioned above, the Desktop Duplication API captures frames in video memory. Parsec is designed from that point onward is to never let the raw frame touch system memory, which would require the CPU to copy raw frame data from the GPU. This means the raw captured frame must pass directly to the encoder, then once the frame is decoded into video memory on the client, it is rendered to the screen directly without any intermediate CPU operations. Any copy into system memory will have a noticeable latency impact.
+
+This is where things can get tricky; if you’ve ever worked with raw video before, you’re probably well aware of color format conversions, specifically from an RGBA style format to a YUV format, and vice versa. For those that have never heard of color formats, let me fill you in.
+
+RGBA is easy to understand. Let’s say you have a 1920×1080 pixel image in RGBA, specifically a 4 byte per pixel format. Roughly 2 million pixels, about 8 MB in size. Each pixel is 4 bytes with 1 byte dedicated to each R, G, B, and A color channel in the that order. These four channels are blended together to create a single color per pixel (also with an opacity value in the case of A), and that’s really all there is to it.
+
+YUV color formats work differently. There are many different kinds of YUV formats, but the NV12 format is the most well represented among video processing libraries, so that’s what I’ll be referring to in this article. NV12 is a planar format, meaning that one section of the frame contains a contiguous Y “luminance” component, and a different section of the frame a UV “chrominance” component. For simplicity, you can think of the Y component as a monochrome image of the raw frame, and the UV component as the color that gets blended on top of that monochrome image. So our same 1920×1080 raw frame in NV12 would begin with a 1920×1080 Y block of 1 byte, essentially monochrome pixels. Immediately following the Y block, we have our block of alternating U and V components, the full block exactly half the height and width of the Y block.
+
+So why is this a problem? If you’ve ever worked with OpenGL or DirectX, you know that the back buffer (the place where the rendering happens) expects some type of RGBA format. The output from the decoder in NV12 must be converted if we are to render it and display it on the screen.
+
+Given the fundamental differences in the two color formats, converting from one to the other is a costly process when done on the CPU. This is why Parsec performs all color conversion on the GPU via pixel shaders, both with OpenGL (macOS) and DirectX (both 9 & 11 on Windows). The final “conversion” renders the raw frame directly to a back buffer, which can then be efficiently displayed on the screen. The raw frame never leaves the GPU, improving latency and saving the CPU a lot of extra work.
+
+If you’d like more information on how we set up these shaders in OpenGL or DirectX, let us know in the comments.
+
+Room for Improvement: Frame Synchronization
+So we finally got that frame as efficiently as possible to the back buffer. But now it needs to be swapped to the front buffer and displayed on the screen. This doesn’t sound hard, and if you’re OK with video tearing, it’s not. The best outcome in terms of latency is to not delay this swap at all and swap immediately after the frame is rendered. Unfortunately, the tearing that can result with this technique is unacceptable, so some kind of synchronization with the refresh rate of your monitor is required — a.k.a V-sync.
+
+The added problem with cloud gaming is that frames arrive in unpredictable intervals. It would be nice if we received frames at precisely 60 FPS with exactly 16.66667 ms between them. But even then, you’ve got an issue, because the client screen’s refresh rate will never match up perfectly to the rate you’re receiving frames. The result is V-sync either accumulating frames, skipping frames, or if left off, causing tearing. Buffering can solve the problem, but I shouldn’t have to tell you that is out of the question 🙂
+
+This is an area of ongoing testing and experimentation for us. Parsec by default enables V-sync, but drops accumulated frames if the frame rate on the server is slightly higher than that of the client. With OpenGL on macOS you don’t have a ton of control, but with DirectX there are a bevy of different swap effects to choose from to try to optimize this. Currently Parsec defaults to the flip-sequential effect as this seems to yield the best performance. We are considering making this an advanced option in the future, since different swap effects seem to work differently on different machines. V-sync can be turned off in the control panel for testing.
+
+This Sounds Cool, But…
+You may be thinking: “Yeah, all this is cool, but what about network latency. You can’t do anything about that.”
+
+You’re right. We can’t do anything about that. But Parsec is meant to be a forwarding-looking product that will be able to grow into infrastructural network improvements, and from the looks of it, things are getting better rapidly as the government is pushing further investments in broadband to the point that more than 90% of the US has 25 Mbps internet.
+
+
+Cloud gaming may not work for everyone now, but it will probably work for most people fairly soon. With network latencies below 20 ms, and bandwidth above 10 Mb/s, Parsec offers a near-native experience.
+
+You can think of Parsec as a research project where the goal is to eliminate latency from cloud gaming. The first iteration may not be 100% of the way there, but you can rest assured we are working everyday to find a way to eliminate that next millisecond.
+
+And as Al Pacino once said:
+
+“Cloud gaming is a game of milliseconds. At Parsec, we fight for that millisecond. We claw with our fingernails for that millisecond. Cause we know when we add up all those milliseconds, that’s going to make the fucking difference between winning and losing.”
